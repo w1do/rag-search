@@ -9,3 +9,5 @@ node_modules/
 apps/web/dist/
 *.egg-info/
 .DS_Store
+.memory/*
+!.memory/annotations.json
