@@ -1,0 +1,118 @@
+name: vector
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile.backend
+  environment:
+    EMAIL: ${EMAIL:-}
+    PASSWORD: ${PASSWORD:-}
+    MCP_TOKEN: ${MCP_TOKEN:-}
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-vector}:${POSTGRES_PASSWORD:-vector}@postgres:5432/${POSTGRES_DB:-vector}
+    QDRANT_URL: http://qdrant:6333
+    TYPESENSE_URL: http://typesense:8108
+    TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-vector-typesense-local}
+    BLOB_DIR: /data/blobs
+    MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10485760}
+    AI_API_KEY: ${AI_API_KEY:-}
+    AI_BASE_URL: ${AI_BASE_URL:-${AI_API_BASE:-https://api.openai.com/v1}}
+    AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-openai/text-embedding-3-small}
+    AI_EMBEDDING_DIM: ${AI_EMBEDDING_DIM:-}
+    SEARCH_TIMEOUT_SECONDS: ${SEARCH_TIMEOUT_SECONDS:-5}
+    INDEX_TIMEOUT_SECONDS: ${INDEX_TIMEOUT_SECONDS:-30}
+  volumes:
+    - blobs:/data/blobs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    qdrant:
+      condition: service_healthy
+    typesense:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vector}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vector}
+      POSTGRES_DB: ${POSTGRES_DB:-vector}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  typesense:
+    image: typesense/typesense:30.2
+    command: ["--data-dir", "/data", "--api-key=${TYPESENSE_API_KEY:-vector-typesense-local}"]
+    volumes:
+      - typesense_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/8108'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    <<: *backend
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "worker.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      typesense:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time,sys; sys.exit(0 if time.time()-os.path.getmtime('/tmp/worker-heartbeat')<60 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: apps/web
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  typesense_data:
+  blobs:

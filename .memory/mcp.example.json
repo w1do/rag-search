@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "project-memory": {
+      "command": "memory",
+      "args": [
+        "mcp",
+        "--project",
+        "/home/dev/opensource/vector-search"
+      ]
+    }
+  }
+}

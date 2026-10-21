@@ -9,21 +9,37 @@ description = "Vector — единая база знаний по проекта
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.153.0",
+    "uvicorn==0.35.0",
     "sqlalchemy==2.0.49",
     "pydantic==2.14.1",
     "alembic==1.20.0",
+    "psycopg[binary]==3.3.6",
     "typer==0.27.3",
     "mcp==2.3.0",
+    "httpx==0.28.1",
+    "pypdf==6.21.1",
+    "python-docx==1.2.0",
+    "python-multipart==0.0.32",
+    "qdrant-client==1.19.1",
+    "typesense==2.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==9.1.1",
-    "httpx==0.28.1",
+    "ruff==0.14.0",
 ]
 
+[project.scripts]
+vector = "vector_cli.main:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["apps/api", "apps/worker", "packages/core", "packages/cli"]
+testpaths = ["tests"]
+
 [tool.uv]
-package = false
+package = true
 
 [tool.setuptools]
-packages = []
+packages = ["vector_cli"]
+package-dir = {"vector_cli" = "packages/cli/vector_cli"}

@@ -6,8 +6,22 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: vector
+          POSTGRES_PASSWORD: vector
+          POSTGRES_DB: vector_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vector -d vector_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,9 +33,13 @@ jobs:
       - run: python -c "import app, worker, vector_core, vector_cli"
         env:
           PYTHONPATH: apps/api:apps/worker:packages/core:packages/cli
+      - run: ruff check packages apps tests
+      - run: pytest -q
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://vector:vector@localhost:5432/vector_test
 
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
@@ -30,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "26"
+          node-version: "22.18.0"
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - run: npm ci

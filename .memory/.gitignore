@@ -1,0 +1,4 @@
+*
+!.gitignore
+!mcp.example.json
+!annotations.json
