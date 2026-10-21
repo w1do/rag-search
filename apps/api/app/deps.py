@@ -22,7 +22,7 @@ from vector_core.db.repositories import (
 )
 from vector_core.domain import Principal, PrincipalKind, Unauthorized
 from vector_core.embeddings import build_embedder
-from vector_core.extract import StandardContentExtractor
+from vector_core.extract import StandardContentExtractor, build_link_fetcher
 from vector_core.indexes import build_indexes
 from vector_core.ports import BlobStore, ContentExtractor, Embedder, TextIndex, VectorIndex
 from vector_core.services import (
@@ -153,6 +153,7 @@ def build_request_services(
             blobs,
             extractor,
             jobs,
+            build_link_fetcher(settings),
             hooks=hooks,
             text_index=text_index,
             vector_index=vector_index,

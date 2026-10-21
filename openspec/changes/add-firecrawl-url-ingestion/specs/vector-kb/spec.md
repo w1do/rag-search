@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Knowledge sources
-The system SHALL accept files, plain text and links as knowledge sources inside a project, and SHALL allow viewing, editing and deleting them. Supported file types SHALL be `.txt`, `.md` and `.pdf`, with a configurable upload size limit (default 10 MB). Link content SHALL be extracted as defined by the `link-extraction` capability: through Firecrawl when it is configured, otherwise through the built-in fetcher.
+The system SHALL accept files, plain text and links as knowledge sources inside a project, and SHALL allow viewing, editing and deleting them. Supported file types SHALL be `.txt`, `.md` and `.pdf`, with a configurable upload size limit (default 10 MB). Link content SHALL be extracted only through Firecrawl as defined by the `link-extraction` capability; without `FIRECRAWL_API_KEY` links SHALL be rejected.
 
 #### Scenario: Add text
 - **WHEN** the user adds text with a title
@@ -12,8 +12,12 @@ The system SHALL accept files, plain text and links as knowledge sources inside 
 - **THEN** a source is created from its extracted text and indexed asynchronously
 
 #### Scenario: Add link
-- **WHEN** the user adds a reachable URL
-- **THEN** its full page content is extracted, a source is created and indexed asynchronously
+- **WHEN** the user adds a reachable URL and `FIRECRAWL_API_KEY` is configured
+- **THEN** its full page content is extracted as Markdown, a source is created and indexed asynchronously
+
+#### Scenario: Link ingestion not configured
+- **WHEN** the user adds a URL and `FIRECRAWL_API_KEY` is not configured
+- **THEN** the request is rejected with a clear error and no source is created
 
 #### Scenario: Unreachable link
 - **WHEN** a link cannot be fetched or its content cannot be extracted

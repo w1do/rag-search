@@ -1,4 +1,5 @@
 import io
+import json
 
 import httpx
 import pytest
@@ -6,8 +7,17 @@ from docx import Document
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from vector_core.chunking import chunk_text
+from vector_core.config import Settings
 from vector_core.domain import PayloadTooLarge, UnsupportedFormat, ValidationError
-from vector_core.extract import SUPPORTED_EXTENSIONS, extract_text, fetch_url
+from vector_core.extract import (
+    SUPPORTED_EXTENSIONS,
+    FirecrawlLinkFetcher,
+    build_link_fetcher,
+    extract_text,
+)
+
+FIRECRAWL_KEY = "fc-test-secret-key-123"
+PAGE_URL = "https://example.test/page"
 
 
 def make_pdf(text: str) -> bytes:
@@ -31,6 +41,23 @@ def make_pdf(text: str) -> bytes:
     buffer = io.BytesIO()
     writer.write(buffer)
     return buffer.getvalue()
+
+
+def firecrawl_ok(markdown: str, title: str | None = "Page Title", status: int = 200) -> dict:
+    metadata: dict = {"sourceURL": PAGE_URL, "statusCode": status}
+    if title is not None:
+        metadata["title"] = title
+    return {"success": True, "data": {"markdown": markdown, "metadata": metadata}}
+
+
+def make_fetcher(handler, timeout: float = 60.0, max_bytes: int = 1000) -> FirecrawlLinkFetcher:
+    return FirecrawlLinkFetcher(
+        FIRECRAWL_KEY,
+        "https://firecrawl.test/",
+        timeout,
+        max_bytes,
+        transport=httpx.MockTransport(handler),
+    )
 
 
 def make_docx(*paragraphs: str) -> bytes:
@@ -68,14 +95,6 @@ def test_docx_paragraphs_are_extracted():
     assert extract_text(make_docx("First", "Second"), None, "doc.docx") == "First\nSecond"
 
 
-def test_html_skips_script_and_style_and_collapses_whitespace():
-    data = (
-        b"<html><head><style>p{}</style><script>var x=1;</script></head>"
-        b"<body><p>Hello   <b>wide</b>\n world</p></body></html>"
-    )
-    assert extract_text(data, "text/html; charset=utf-8", None) == "Hello wide world"
-
-
 def test_plain_text_content_type_is_decoded_without_filename():
     assert extract_text(b"plain", "text/plain", None) == "plain"
 
@@ -85,47 +104,138 @@ def test_unknown_format_is_unsupported():
         extract_text(b"\x89PNG", "image/png", "picture.png")
 
 
-def test_fetch_url_rejects_non_http_schemes():
-    with pytest.raises(ValidationError):
-        fetch_url("ftp://example.test/file.txt", timeout=5, max_bytes=100)
+def test_firecrawl_posts_scrape_request_with_bearer_key():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json=firecrawl_ok("# Title\n\nBody"))
+
+    fetched = make_fetcher(handler, timeout=45).fetch(PAGE_URL)
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://firecrawl.test/v2/scrape"
+    assert seen["auth"] == f"Bearer {FIRECRAWL_KEY}"
+    assert seen["body"] == {
+        "url": PAGE_URL,
+        "formats": ["markdown"],
+        "onlyMainContent": True,
+        "timeout": 45000,
+    }
+    assert seen["timeout"]["read"] == 55
+    assert fetched.markdown == "# Title\n\nBody"
+    assert fetched.title == "Page Title"
 
 
-def test_fetch_url_returns_body_and_content_type():
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
-            200,
-            content=b"hello",
-            headers={"content-type": "text/plain; charset=utf-8"},
-        )
-    )
+@pytest.mark.parametrize(("timeout", "expected"), [(0.2, 1000), (60, 60000), (900, 300000)])
+def test_firecrawl_timeout_is_clamped(timeout, expected):
+    seen: dict = {}
 
-    body, content_type = fetch_url(
-        "https://example.test/a.txt", timeout=5, max_bytes=100, transport=transport
-    )
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = json.loads(request.content)["timeout"]
+        return httpx.Response(200, json=firecrawl_ok("text"))
 
-    assert body == b"hello"
-    assert content_type == "text/plain; charset=utf-8"
+    make_fetcher(handler, timeout=timeout).fetch(PAGE_URL)
+
+    assert seen["timeout"] == expected
 
 
-def test_fetch_url_rejects_declared_size_over_limit():
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 11))
+def test_firecrawl_missing_title_is_none():
+    fetcher = make_fetcher(lambda request: httpx.Response(200, json=firecrawl_ok("text", title=None)))
+
+    assert fetcher.fetch(PAGE_URL).title is None
+
+
+def test_firecrawl_rejects_non_http_scheme_without_request():
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=firecrawl_ok("text"))
+
+    with pytest.raises(ValidationError, match="only http and https"):
+        make_fetcher(handler).fetch("ftp://example.test/file.txt")
+    assert calls == []
+
+
+def _raise_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout(f"timed out {request.headers['authorization']}", request=request)
+
+
+def _raise_connect(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+@pytest.mark.parametrize(
+    ("handler", "error", "message"),
+    [
+        (lambda r: httpx.Response(402, json={"success": False}), ValidationError, "firecrawl: credits exhausted"),
+        (lambda r: httpx.Response(429, json={"success": False}), ValidationError, "firecrawl: rate limit exceeded"),
+        (
+            lambda r: httpx.Response(401, json={"error": f"bad key {FIRECRAWL_KEY}"}),
+            ValidationError,
+            "firecrawl: request rejected (check FIRECRAWL_API_KEY)",
+        ),
+        (
+            lambda r: httpx.Response(403, json={"success": False}),
+            ValidationError,
+            "firecrawl: request rejected (check FIRECRAWL_API_KEY)",
+        ),
+        (lambda r: httpx.Response(500, text="oops"), ValidationError, "url could not be fetched via firecrawl"),
+        (lambda r: httpx.Response(503, json={}), ValidationError, "url could not be fetched via firecrawl"),
+        (_raise_timeout, ValidationError, "url could not be fetched via firecrawl"),
+        (_raise_connect, ValidationError, "url could not be fetched via firecrawl"),
+        (lambda r: httpx.Response(200, text="not json"), ValidationError, "url could not be fetched via firecrawl"),
+        (
+            lambda r: httpx.Response(200, json={"success": False, "error": "blocked"}),
+            ValidationError,
+            "url could not be fetched via firecrawl",
+        ),
+        (
+            lambda r: httpx.Response(
+                200, json={"success": False, "data": {"metadata": {"statusCode": 410}}}
+            ),
+            ValidationError,
+            "url returned status 410",
+        ),
+        (lambda r: httpx.Response(200, json=firecrawl_ok("gone", status=404)), ValidationError, "url returned status 404"),
+        (lambda r: httpx.Response(200, json=firecrawl_ok("   \n\t")), ValidationError, "no content extracted from url"),
+        (
+            lambda r: httpx.Response(200, json={"success": True, "data": {"metadata": {}}}),
+            ValidationError,
+            "no content extracted from url",
+        ),
+        (lambda r: httpx.Response(200, json=firecrawl_ok("x" * 1001)), PayloadTooLarge, "remote content exceeds size limit"),
+    ],
+)
+def test_firecrawl_errors_are_mapped_without_leaking_key(handler, error, message):
+    with pytest.raises(error) as excinfo:
+        make_fetcher(handler).fetch(PAGE_URL)
+
+    assert str(excinfo.value) == message
+    assert FIRECRAWL_KEY not in str(excinfo.value)
+    assert FIRECRAWL_KEY not in repr(excinfo.value)
+
+
+def test_firecrawl_size_limit_counts_utf8_bytes():
+    fetcher = make_fetcher(lambda r: httpx.Response(200, json=firecrawl_ok("я" * 501)))
 
     with pytest.raises(PayloadTooLarge):
-        fetch_url("https://example.test/big", timeout=5, max_bytes=10, transport=transport)
+        fetcher.fetch(PAGE_URL)
 
 
-def test_fetch_url_rejects_streamed_body_over_limit():
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=iter([b"x" * 6, b"x" * 6])))
+def test_build_link_fetcher_requires_firecrawl_key():
+    settings = Settings(database_url="", email="", password="", mcp_token="")
 
-    with pytest.raises(PayloadTooLarge):
-        fetch_url("https://example.test/stream", timeout=5, max_bytes=10, transport=transport)
-
-
-def test_fetch_url_maps_http_errors_to_validation_error():
-    transport = httpx.MockTransport(lambda request: httpx.Response(500))
-
-    with pytest.raises(ValidationError):
-        fetch_url("https://example.test/broken", timeout=5, max_bytes=100, transport=transport)
+    assert build_link_fetcher(settings) is None
+    configured = Settings(
+        database_url="", email="", password="", mcp_token="", firecrawl_api_key=FIRECRAWL_KEY
+    )
+    assert isinstance(build_link_fetcher(configured), FirecrawlLinkFetcher)
 
 
 def test_chunk_text_returns_nothing_for_blank_text():

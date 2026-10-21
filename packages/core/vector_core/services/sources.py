@@ -6,8 +6,6 @@ from pathlib import PurePosixPath
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
-import httpx
-
 from vector_core.config import Settings
 from vector_core.domain import (
     Conflict,
@@ -15,6 +13,7 @@ from vector_core.domain import (
     Job,
     NotFound,
     PayloadTooLarge,
+    ServiceUnavailable,
     Source,
     SourceKind,
     SourceStatus,
@@ -27,8 +26,15 @@ from vector_core.domain import (
     VersionStatus,
     utcnow,
 )
-from vector_core.extract import SUPPORTED_EXTENSIONS, fetch_url
-from vector_core.ports import BlobStore, ContentExtractor, IndexBackendError, TextIndex, VectorIndex
+from vector_core.extract import SUPPORTED_EXTENSIONS, check_link_url
+from vector_core.ports import (
+    BlobStore,
+    ContentExtractor,
+    IndexBackendError,
+    LinkFetcher,
+    TextIndex,
+    VectorIndex,
+)
 from vector_core.repositories import (
     ChunkRepository,
     ProjectRepository,
@@ -42,14 +48,10 @@ from vector_core.services.jobs import JobQueueService
 INDEX_VERSION_JOB = "index_version"
 PURGE_SOURCE_JOB = "purge_source"
 TEXT_EXTENSION = "txt"
+LINK_EXTENSION = "md"
+LINK_CONTENT_TYPE = "text/markdown"
+LINK_INGESTION_NOT_CONFIGURED = "link ingestion requires FIRECRAWL_API_KEY"
 logger = logging.getLogger(__name__)
-MEDIA_TYPE_EXTENSIONS = {
-    "text/plain": "txt",
-    "text/markdown": "md",
-    "text/html": "html",
-    "application/pdf": "pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-}
 
 
 def content_hash(data: bytes) -> str:
@@ -109,7 +111,7 @@ class SourceService:
         blobs: BlobStore,
         extractor: ContentExtractor,
         jobs: JobQueueService,
-        transport: httpx.BaseTransport | None = None,
+        link_fetcher: LinkFetcher | None = None,
         *,
         hooks: TransactionHooks,
         text_index: TextIndex,
@@ -123,7 +125,7 @@ class SourceService:
         self._blobs = blobs
         self._extractor = extractor
         self._jobs = jobs
-        self._transport = transport
+        self._link_fetcher = link_fetcher
         self._hooks = hooks
         self._text_index = text_index
         self._vector_index = vector_index
@@ -172,8 +174,11 @@ class SourceService:
         """Add a link; re-posting a link whose earlier fetch failed retries it on the same source."""
         self._require_project(project_id)
         cleaned_url = url.strip()
-        if urlsplit(cleaned_url).scheme.lower() not in {"http", "https"}:
-            raise ValidationError("only http and https urls are supported")
+        check_link_url(cleaned_url)
+        if self._link_fetcher is None:
+            raise ServiceUnavailable(
+                LINK_INGESTION_NOT_CONFIGURED, code="link_ingestion_not_configured"
+            )
         existing = self._sources.get_by_origin(project_id, cleaned_url)
         if existing is None:
             source = self._new_source(
@@ -190,30 +195,26 @@ class SourceService:
                 raise Conflict("url already added to this project")
             if title is not None:
                 source = replace(source, title=clean_name(title, "title"))
-        self._fetch_url_version(source, cleaned_url)
+        self._fetch_url_version(
+            self._link_fetcher, source, cleaned_url, explicit_title=title is not None
+        )
         return self._refresh(source.id)
 
-    def _fetch_url_version(self, source: Source, url: str) -> Job | None:
+    def _fetch_url_version(
+        self, fetcher: LinkFetcher, source: Source, url: str, *, explicit_title: bool
+    ) -> Job | None:
         try:
-            data, content_type = fetch_url(
-                url,
-                timeout=self._settings.link_fetch_timeout_seconds,
-                max_bytes=self._settings.max_upload_bytes,
-                transport=self._transport,
-            )
-            extension = self._url_extension(url, content_type)
-            filename = (
-                f"{source.id}.{extension}"
-                if extension in SUPPORTED_EXTENSIONS
-                else None
-            )
-            text = self._extractor.extract(data, content_type, filename)
+            fetched = fetcher.fetch(url)
         except DomainError as exc:
             self._mark_failed(source, str(exc))
             return None
-        source = replace(source, content_type=_media_type(content_type) or None)
+        title = source.title
+        if not explicit_title and fetched.title:
+            title = clean_name(fetched.title, "title")
+        source = replace(source, title=title, content_type=LINK_CONTENT_TYPE)
         self._sources.update(source)
-        return self._store_version(source, data, extension, text)
+        data = fetched.markdown.encode("utf-8")
+        return self._store_version(source, data, LINK_EXTENSION, fetched.markdown)
 
     def list_for_project(self, project_id: UUID) -> list[Source]:
         self._require_project(project_id)
@@ -440,12 +441,6 @@ class SourceService:
             raise PayloadTooLarge(
                 f"payload exceeds {self._settings.max_upload_bytes} bytes"
             )
-
-    def _url_extension(self, url: str, content_type: str | None) -> str:
-        from_path = file_extension(urlsplit(url).path)
-        if from_path in SUPPORTED_EXTENSIONS:
-            return from_path
-        return MEDIA_TYPE_EXTENSIONS.get(_media_type(content_type), "bin")
 
     def _new_source(
         self,

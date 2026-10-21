@@ -1,6 +1,8 @@
 from vector_core.config import (
     DEFAULT_AI_BASE_URL,
     DEFAULT_AI_EMBEDDING_MODEL,
+    DEFAULT_FIRECRAWL_BASE_URL,
+    DEFAULT_FIRECRAWL_TIMEOUT_SECONDS,
     Settings,
 )
 
@@ -32,3 +34,28 @@ def test_empty_ai_embedding_model_uses_default():
     settings = Settings.from_env({"AI_EMBEDDING_MODEL": ""})
 
     assert settings.ai_embedding_model == DEFAULT_AI_EMBEDDING_MODEL
+
+
+def test_firecrawl_settings_default_when_nothing_set():
+    settings = Settings.from_env({})
+
+    assert settings.firecrawl_api_key == ""
+    assert settings.firecrawl_base_url == DEFAULT_FIRECRAWL_BASE_URL
+    assert settings.firecrawl_timeout_seconds == DEFAULT_FIRECRAWL_TIMEOUT_SECONDS
+    assert settings.link_ingestion_configured is False
+
+
+def test_firecrawl_settings_are_read_from_env_and_key_is_hidden():
+    settings = Settings.from_env(
+        {
+            "FIRECRAWL_API_KEY": "fc-secret-value",
+            "FIRECRAWL_BASE_URL": "https://firecrawl.internal",
+            "FIRECRAWL_TIMEOUT_SECONDS": "90",
+        }
+    )
+
+    assert settings.firecrawl_api_key == "fc-secret-value"
+    assert settings.firecrawl_base_url == "https://firecrawl.internal"
+    assert settings.firecrawl_timeout_seconds == 90.0
+    assert settings.link_ingestion_configured is True
+    assert "fc-secret-value" not in repr(settings)

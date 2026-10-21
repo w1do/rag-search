@@ -12,6 +12,7 @@ Vector — самостоятельный сервис единой базы з�
 - Вход по `.env`: `EMAIL=` и `PASSWORD=` — вход в веб-интерфейс/API; `MCP_TOKEN=` — токен агентов для MCP. Значения только из vault, в репозиторий не попадают.
 - Запуск одной командой (цель, этап 3): `cp .env.example .env`, заполнить `EMAIL`, `PASSWORD`, `MCP_TOKEN` и `docker compose up -d`. Остальные переменные имеют значения по умолчанию в compose; ручная настройка не требуется.
 - AI: `AI_API_KEY` (из vault), `AI_API_BASE` или `AI_BASE_URL` (по умолчанию Polza в `.env.example`), `AI_EMBEDDING_MODEL=openai/text-embedding-3-small`; без ключа работает только полнотекстовый поиск с предупреждением. Смена модели или размерности: удалить коллекцию Qdrant `chunks` и выполнить reindex.
+- Ссылки: `FIRECRAWL_API_KEY` (из vault) обязателен для источников-ссылок — страница загружается только через Firecrawl Scrape API v2 (`/v2/scrape`, Markdown основного контента) и индексируется целиком; встроенного HTTP-загрузчика нет. Без ключа `POST /sources/url` возвращает `503 link_ingestion_not_configured`, источник не создаётся. Опционально: `FIRECRAWL_BASE_URL` (по умолчанию `https://api.firecrawl.dev`), `FIRECRAWL_TIMEOUT_SECONDS` (по умолчанию `60`). Старые URL-источники, загруженные встроенным загрузчиком, нужно удалить и добавить заново.
 - Статус: `docker-compose.yml` и авторизация по этим переменным реализованы (PLAN.md, этапы 3–4).
 
 ## Правила

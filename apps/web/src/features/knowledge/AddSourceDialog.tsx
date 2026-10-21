@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import { queryKeys } from "@/api/queries";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ import { getErrorMessage } from "@/lib/errors";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const FILE_ACCEPT = ".txt,.md,.pdf,.docx";
+const LINK_NOT_CONFIGURED = "link_ingestion_not_configured";
 
 type SourceKind = "text" | "file" | "url";
 
@@ -36,6 +37,16 @@ function uploadErrorMessage(error: unknown): string {
   }
   if (status === 422) {
     return "Формат файла не поддерживается. Допустимы TXT, MD, PDF и DOCX";
+  }
+  return getErrorMessage(error);
+}
+
+function linkErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === LINK_NOT_CONFIGURED) {
+    return "Добавление ссылок недоступно: на сервере не задан FIRECRAWL_API_KEY";
+  }
+  if (error instanceof ApiError && error.status === 422) {
+    return "Поддерживаются только ссылки http и https";
   }
   return getErrorMessage(error);
 }
@@ -64,7 +75,8 @@ export function AddSourceDialog({ projectId, open, onOpenChange }: AddSourceDial
       reset();
       onOpenChange(false);
     },
-    onError: (error) => toast.error(uploadErrorMessage(error)),
+    onError: (error) =>
+      toast.error(kind === "url" ? linkErrorMessage(error) : uploadErrorMessage(error)),
     onSettled: () => queryClient.invalidateQueries({ queryKey: queryKeys.sources(projectId) }),
   });
 

@@ -11,7 +11,8 @@ DEFAULT_JOB_BACKOFF_BASE_SECONDS = 5.0
 DEFAULT_JOB_BACKOFF_MAX_SECONDS = 300.0
 DEFAULT_BLOB_DIR = "/data/blobs"
 DEFAULT_MAX_UPLOAD_BYTES = 10485760
-DEFAULT_LINK_FETCH_TIMEOUT_SECONDS = 15.0
+DEFAULT_FIRECRAWL_BASE_URL = "https://api.firecrawl.dev"
+DEFAULT_FIRECRAWL_TIMEOUT_SECONDS = 60.0
 DEFAULT_CHUNK_SIZE_CHARS = 800
 DEFAULT_CHUNK_OVERLAP_CHARS = 100
 DEFAULT_QDRANT_URL = "http://qdrant:6333"
@@ -42,7 +43,6 @@ class Settings:
     job_backoff_max_seconds: float = DEFAULT_JOB_BACKOFF_MAX_SECONDS
     blob_dir: Path = Path(DEFAULT_BLOB_DIR)
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
-    link_fetch_timeout_seconds: float = DEFAULT_LINK_FETCH_TIMEOUT_SECONDS
     chunk_size_chars: int = DEFAULT_CHUNK_SIZE_CHARS
     chunk_overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS
     qdrant_url: str = DEFAULT_QDRANT_URL
@@ -54,6 +54,9 @@ class Settings:
     ai_embedding_dim: int | None = None
     search_timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT_SECONDS
     index_timeout_seconds: float = DEFAULT_INDEX_TIMEOUT_SECONDS
+    firecrawl_api_key: str = field(default="", repr=False)
+    firecrawl_base_url: str = DEFAULT_FIRECRAWL_BASE_URL
+    firecrawl_timeout_seconds: float = DEFAULT_FIRECRAWL_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -77,9 +80,6 @@ class Settings:
             ),
             blob_dir=Path(source.get("BLOB_DIR", DEFAULT_BLOB_DIR)),
             max_upload_bytes=int(source.get("MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES)),
-            link_fetch_timeout_seconds=float(
-                source.get("LINK_FETCH_TIMEOUT_SECONDS", DEFAULT_LINK_FETCH_TIMEOUT_SECONDS)
-            ),
             chunk_size_chars=int(source.get("CHUNK_SIZE_CHARS", DEFAULT_CHUNK_SIZE_CHARS)),
             chunk_overlap_chars=int(source.get("CHUNK_OVERLAP_CHARS", DEFAULT_CHUNK_OVERLAP_CHARS)),
             qdrant_url=source.get("QDRANT_URL", DEFAULT_QDRANT_URL),
@@ -95,6 +95,11 @@ class Settings:
             index_timeout_seconds=float(
                 source.get("INDEX_TIMEOUT_SECONDS", DEFAULT_INDEX_TIMEOUT_SECONDS)
             ),
+            firecrawl_api_key=source.get("FIRECRAWL_API_KEY", ""),
+            firecrawl_base_url=source.get("FIRECRAWL_BASE_URL") or DEFAULT_FIRECRAWL_BASE_URL,
+            firecrawl_timeout_seconds=float(
+                source.get("FIRECRAWL_TIMEOUT_SECONDS") or DEFAULT_FIRECRAWL_TIMEOUT_SECONDS
+            ),
         )
 
     @property
@@ -104,6 +109,10 @@ class Settings:
     @property
     def embeddings_configured(self) -> bool:
         return bool(self.ai_api_key)
+
+    @property
+    def link_ingestion_configured(self) -> bool:
+        return bool(self.firecrawl_api_key)
 
 
 def _optional_int(value: str | None) -> int | None:

@@ -2,6 +2,7 @@ from typing import Protocol
 from uuid import UUID
 
 from vector_core.domain import Chunk
+from vector_core.extract import FetchedLink
 
 
 class IndexBackendError(Exception):
@@ -22,6 +23,10 @@ class BlobStore(Protocol):
 
 class ContentExtractor(Protocol):
     def extract(self, data: bytes, content_type: str | None, filename: str | None) -> str: ...
+
+
+class LinkFetcher(Protocol):
+    def fetch(self, url: str) -> FetchedLink: ...
 
 
 class VectorIndex(Protocol):

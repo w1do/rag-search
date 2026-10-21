@@ -24,7 +24,7 @@ from vector_core.domain import (
     VersionStatus,
 )
 from vector_core.embeddings import NullEmbedder
-from vector_core.extract import StandardContentExtractor
+from vector_core.extract import StandardContentExtractor, build_link_fetcher
 from vector_core.indexes.memory import InMemoryTextIndex, InMemoryVectorIndex
 from vector_core.ports import Embedder, TextIndex, VectorIndex
 from vector_core.services import (
@@ -426,7 +426,7 @@ def build_services(
             blob_store,
             StandardContentExtractor(),
             jobs,
-            transport=transport,
+            build_link_fetcher(settings, transport=transport),
             hooks=transaction_hooks,
             text_index=text,
             vector_index=vector,

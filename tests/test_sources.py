@@ -1,4 +1,6 @@
 import io
+import json
+from dataclasses import replace
 from uuid import uuid4
 
 import httpx
@@ -9,7 +11,12 @@ from pypdf import PdfWriter
 
 from app.deps import Services
 from tests.conftest import MCP_TOKEN, OWNER_EMAIL, OWNER_PASSWORD
-from tests.fakes import InMemoryBlobStore, InMemoryStore, build_services
+from tests.fakes import (
+    InMemoryBlobStore,
+    InMemoryStore,
+    build_services,
+    memory_indexing_scope,
+)
 from vector_core.config import Settings
 from vector_core.domain import (
     Chunk,
@@ -17,16 +24,20 @@ from vector_core.domain import (
     JobStatus,
     NotFound,
     PayloadTooLarge,
+    ServiceUnavailable,
     SourceKind,
     SourceStatus,
     UnsupportedFormat,
     ValidationError,
     VersionStatus,
 )
-from vector_core.services import INDEX_VERSION_JOB
+from vector_core.embeddings import NullEmbedder
+from vector_core.indexes.memory import InMemoryTextIndex, InMemoryVectorIndex
+from vector_core.services import INDEX_VERSION_JOB, IndexingService
 from vector_core.services.common import TransactionHooks
 
 SMALL_LIMIT = 64
+FIRECRAWL_KEY = "fc-test-secret-key-123"
 
 
 def make_docx(text: str) -> bytes:
@@ -47,6 +58,19 @@ def make_pdf() -> bytes:
 
 def url_transport(handler) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
+
+
+def firecrawl_settings(settings: Settings, **overrides) -> Settings:
+    return replace(settings, firecrawl_api_key=FIRECRAWL_KEY, **overrides)
+
+
+def firecrawl_page(markdown: str, title: str | None = None, status: int = 200) -> httpx.Response:
+    metadata: dict = {"sourceURL": "https://example.test", "statusCode": status}
+    if title is not None:
+        metadata["title"] = title
+    return httpx.Response(
+        200, json={"success": True, "data": {"markdown": markdown, "metadata": metadata}}
+    )
 
 
 @pytest.fixture
@@ -201,84 +225,214 @@ def test_add_file_over_limit(store: InMemoryStore, project_id):
         )
 
 
-def test_add_url_fetches_html_and_queues_index(
+def test_add_url_indexes_full_firecrawl_markdown(
     store: InMemoryStore, settings: Settings, blobs: InMemoryBlobStore
 ):
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/page"
-        return httpx.Response(
-            200,
-            text="<html><body><h1>Hi</h1><script>x()</script></body></html>",
-            headers={"content-type": "text/html; charset=utf-8"},
-        )
+    seen: list[httpx.Request] = []
+    sections = [f"## Section {i}\n\n" + f"paragraph {i} " * 60 for i in range(30)]
+    markdown = "# Guide\n\n" + "\n\n".join(sections) + "\n\nTAIL-MARKER-END"
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return firecrawl_page(markdown, title="  Full Guide  ")
+
+    text, vector = InMemoryTextIndex(), InMemoryVectorIndex()
+    config = firecrawl_settings(settings)
     services = build_services(
-        settings, store, blobs=blobs, transport=url_transport(handler)
+        config,
+        store,
+        blobs=blobs,
+        transport=url_transport(handler),
+        text_index=text,
+        vector_index=vector,
     )
     project_id = services.projects.create("Links").id
 
-    source = services.sources.add_url(project_id, "https://example.test/page")
+    source = services.sources.add_url(project_id, "  https://example.test/guide  ")
 
+    assert len(seen) == 1
+    assert json.loads(seen[0].content)["url"] == "https://example.test/guide"
     assert source.kind is SourceKind.URL
-    assert source.title == "page"
-    assert source.origin_key == "https://example.test/page"
-    assert source.content_type == "text/html"
+    assert source.title == "Full Guide"
+    assert source.origin_key == "https://example.test/guide"
+    assert source.content_type == "text/markdown"
     assert source.status is SourceStatus.PENDING
     version = services.sources.versions(project_id, source.id)[0]
-    assert version.extracted_text == "Hi"
-    assert version.storage_key == f"{project_id}/{source.id}/1.html"
-    assert blobs.exists(version.storage_key)
-    assert len(jobs_of_type(store, INDEX_VERSION_JOB)) == 1
+    assert version.extracted_text == markdown
+    assert version.extracted_chars == len(markdown)
+    assert version.storage_key == f"{project_id}/{source.id}/1.md"
+    assert blobs.get(version.storage_key) == markdown.encode("utf-8")
+    jobs = jobs_of_type(store, INDEX_VERSION_JOB)
+    assert len(jobs) == 1
+
+    indexing = IndexingService(memory_indexing_scope(store), text, vector, NullEmbedder(), config)
+    indexing.index_version(project_id, source.id, version.id, final_attempt=True)
+
+    chunks = [c for c in store.chunks.values() if c.version_id == version.id]
+    assert len(chunks) > 10
+    assert set(text.docs) == {c.id for c in chunks}
+    assert any("TAIL-MARKER-END" in c.text for c in chunks)
+    assert services.sources.get(project_id, source.id).status is SourceStatus.INDEXED
 
 
-def test_add_url_unreachable_marks_source_failed(
+def test_add_url_explicit_title_wins_over_page_title(
     store: InMemoryStore, settings: Settings
 ):
+    services = build_services(
+        firecrawl_settings(settings),
+        store,
+        transport=url_transport(lambda r: firecrawl_page("body", title="Page Title")),
+    )
+    project_id = services.projects.create("Links").id
+
+    source = services.sources.add_url(project_id, "https://example.test/a", title=" Mine ")
+
+    assert source.title == "Mine"
+
+
+def test_add_url_without_page_title_keeps_url_title(
+    store: InMemoryStore, settings: Settings
+):
+    services = build_services(
+        firecrawl_settings(settings),
+        store,
+        transport=url_transport(lambda r: firecrawl_page("body", title=None)),
+    )
+    project_id = services.projects.create("Links").id
+
+    source = services.sources.add_url(project_id, "https://example.test/docs/page")
+
+    assert source.title == "page"
+
+
+def test_add_url_without_firecrawl_key_is_rejected_without_requests(
+    services: Services, store: InMemoryStore, project_id
+):
+    with pytest.raises(ServiceUnavailable) as excinfo:
+        services.sources.add_url(project_id, "https://example.test/page")
+
+    assert str(excinfo.value) == "link ingestion requires FIRECRAWL_API_KEY"
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "link_ingestion_not_configured"
+    assert store.sources == {}
+    assert jobs_of_type(store, INDEX_VERSION_JOB) == []
+
+
+def test_add_url_without_firecrawl_key_sends_nothing(
+    store: InMemoryStore, settings: Settings
+):
+    calls: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
+        calls.append(request)
+        return firecrawl_page("body")
 
     services = build_services(settings, store, transport=url_transport(handler))
+    project_id = services.projects.create("Links").id
+
+    with pytest.raises(ServiceUnavailable):
+        services.sources.add_url(project_id, "https://example.test/page")
+    assert calls == []
+    assert store.sources == {}
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(402, json={"success": False}), "firecrawl: credits exhausted"),
+        (httpx.Response(429, json={"success": False}), "firecrawl: rate limit exceeded"),
+        (
+            httpx.Response(401, json={"error": "invalid token"}),
+            "firecrawl: request rejected (check FIRECRAWL_API_KEY)",
+        ),
+        (httpx.Response(502, text="bad gateway"), "url could not be fetched via firecrawl"),
+        (
+            httpx.Response(200, json={"success": False, "data": {"metadata": {"statusCode": 404}}}),
+            "url returned status 404",
+        ),
+        (httpx.Response(200, json={"success": True, "data": {"markdown": " "}}), "no content extracted from url"),
+    ],
+)
+def test_add_url_firecrawl_error_marks_source_failed(
+    store: InMemoryStore, settings: Settings, response: httpx.Response, message: str
+):
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(lambda r: response)
+    )
     project_id = services.projects.create("Links").id
 
     source = services.sources.add_url(project_id, "https://down.test/doc", title="Down")
 
     assert source.status is SourceStatus.FAILED
-    assert source.error_message == "url could not be fetched"
+    assert source.error_message == message
+    assert FIRECRAWL_KEY not in source.error_message
     assert services.sources.versions(project_id, source.id) == []
     assert jobs_of_type(store, INDEX_VERSION_JOB) == []
     assert services.sources.get(project_id, source.id).title == "Down"
 
 
-def test_add_url_unsupported_content_marks_failed(
-    store: InMemoryStore, settings: Settings
+def test_add_url_timeout_marks_failed_without_leaking_key(
+    store: InMemoryStore, settings: Settings, caplog: pytest.LogCaptureFixture
 ):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, content=b"\x00\x01", headers={"content-type": "image/png"}
-        )
+        raise httpx.ReadTimeout(request.headers["authorization"], request=request)
 
-    services = build_services(settings, store, transport=url_transport(handler))
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(handler)
+    )
     project_id = services.projects.create("Links").id
-    source = services.sources.add_url(project_id, "https://img.test/pic.png")
+
+    with caplog.at_level("DEBUG"):
+        source = services.sources.add_url(project_id, "https://slow.test/doc")
+
     assert source.status is SourceStatus.FAILED
-    assert source.error_message == "unsupported content type"
+    assert source.error_message == "url could not be fetched via firecrawl"
+    assert FIRECRAWL_KEY not in caplog.text
+    assert all(FIRECRAWL_KEY not in str(vars(s)) for s in store.sources.values())
+
+
+def test_add_url_over_size_limit_marks_failed(store: InMemoryStore, settings: Settings):
+    services = build_services(
+        firecrawl_settings(settings, max_upload_bytes=SMALL_LIMIT),
+        store,
+        transport=url_transport(lambda r: firecrawl_page("x" * (SMALL_LIMIT + 1))),
+    )
+    project_id = services.projects.create("Links").id
+
+    source = services.sources.add_url(project_id, "https://big.test/doc")
+
+    assert source.status is SourceStatus.FAILED
+    assert source.error_message == "remote content exceeds size limit"
+    assert services.sources.versions(project_id, source.id) == []
 
 
 def test_add_url_rejects_non_http_scheme(
-    services: Services, store: InMemoryStore, project_id
+    store: InMemoryStore, settings: Settings
 ):
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return firecrawl_page("body")
+
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(handler)
+    )
+    project_id = services.projects.create("Links").id
     with pytest.raises(ValidationError):
         services.sources.add_url(project_id, "ftp://example.test/file")
     assert store.sources == {}
+    assert calls == []
 
 
 def test_add_url_duplicate_with_versions_is_conflict(
     store: InMemoryStore, settings: Settings
 ):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="body", headers={"content-type": "text/plain"})
-
-    services = build_services(settings, store, transport=url_transport(handler))
+    services = build_services(
+        firecrawl_settings(settings),
+        store,
+        transport=url_transport(lambda r: firecrawl_page("body")),
+    )
     project_id = services.projects.create("Links").id
     other_project = services.projects.create("Other").id
     first = services.sources.add_url(project_id, "https://example.test/a")
@@ -299,28 +453,35 @@ def test_add_url_retries_failed_source_on_same_origin(
     def handler(request: httpx.Request) -> httpx.Response:
         attempts["count"] += 1
         if attempts["count"] == 1:
-            raise httpx.ConnectError("down", request=request)
-        return httpx.Response(
-            200, text="now up", headers={"content-type": "text/plain"}
-        )
+            return httpx.Response(429, json={"success": False})
+        return firecrawl_page("now up", title="Page Title")
 
-    services = build_services(settings, store, transport=url_transport(handler))
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(handler)
+    )
     project_id = services.projects.create("Links").id
     failed = services.sources.add_url(project_id, "https://flaky.test/doc")
     assert failed.status is SourceStatus.FAILED
+    assert failed.error_message == "firecrawl: rate limit exceeded"
 
-    retried = services.sources.add_url(
-        project_id, "https://flaky.test/doc", title="Doc"
-    )
+    retried = services.sources.add_url(project_id, "https://flaky.test/doc")
 
+    assert attempts["count"] == 2
     assert retried.id == failed.id
-    assert retried.title == "Doc"
+    assert retried.title == "Page Title"
     assert retried.status is SourceStatus.PENDING
     assert retried.error_message is None
-    assert retried.content_type == "text/plain"
+    assert retried.content_type == "text/markdown"
     assert [v.version for v in services.sources.versions(project_id, failed.id)] == [1]
     assert len(store.sources) == 1
     assert len(jobs_of_type(store, INDEX_VERSION_JOB)) == 1
+
+
+def test_settings_repr_hides_firecrawl_key(settings: Settings):
+    configured = firecrawl_settings(settings)
+
+    assert FIRECRAWL_KEY not in repr(configured)
+    assert "firecrawl_api_key" not in repr(configured)
 
 
 def test_blob_written_in_rolled_back_transaction_is_removed(
@@ -503,7 +664,9 @@ def test_reindex_without_versions_is_validation_error(
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("down", request=request)
 
-    services = build_services(settings, store, transport=url_transport(handler))
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(handler)
+    )
     project_id = services.projects.create("Links").id
     failed = services.sources.add_url(project_id, "https://down.test/x")
     with pytest.raises(ValidationError):
@@ -625,16 +788,10 @@ def test_http_upload_over_limit_is_413(
     assert store.sources == {}
 
 
-def test_http_url_source(make_client, store: InMemoryStore, settings: Settings):
+def _owner_client(services: Services) -> tuple[TestClient, dict[str, str], str]:
     from app.deps import get_services
     from app.main import app
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, text="plain body", headers={"content-type": "text/plain"}
-        )
-
-    services = build_services(settings, store, transport=url_transport(handler))
     app.dependency_overrides[get_services] = lambda: services
     client = TestClient(app)
     login = client.post(
@@ -644,6 +801,18 @@ def test_http_url_source(make_client, store: InMemoryStore, settings: Settings):
     project_id = client.post(
         "/api/projects", json={"name": "Links"}, headers=headers
     ).json()["id"]
+    return client, headers, project_id
+
+
+def test_http_url_source(store: InMemoryStore, settings: Settings):
+    from app.main import app
+
+    services = build_services(
+        firecrawl_settings(settings),
+        store,
+        transport=url_transport(lambda r: firecrawl_page("# A\n\nbody", title="Doc A")),
+    )
+    client, headers, project_id = _owner_client(services)
 
     response = client.post(
         f"/api/projects/{project_id}/sources/url",
@@ -652,7 +821,7 @@ def test_http_url_source(make_client, store: InMemoryStore, settings: Settings):
     )
     assert response.status_code == 201
     assert response.json()["kind"] == "url"
-    assert response.json()["title"] == "a.txt"
+    assert response.json()["title"] == "Doc A"
 
     invalid = client.post(
         f"/api/projects/{project_id}/sources/url",
@@ -670,8 +839,41 @@ def test_http_url_source(make_client, store: InMemoryStore, settings: Settings):
     app.dependency_overrides.clear()
 
 
+def test_http_url_source_without_firecrawl_key_is_503(
+    store: InMemoryStore, settings: Settings
+):
+    from app.main import app
+
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return firecrawl_page("body")
+
+    services = build_services(settings, store, transport=url_transport(handler))
+    client, headers, project_id = _owner_client(services)
+
+    response = client.post(
+        f"/api/projects/{project_id}/sources/url",
+        json={"url": "https://example.test/a"},
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "link_ingestion_not_configured",
+            "message": "link ingestion requires FIRECRAWL_API_KEY",
+        }
+    }
+    assert calls == []
+    assert client.get(
+        f"/api/projects/{project_id}/sources", headers=headers
+    ).json() == []
+    app.dependency_overrides.clear()
+
+
 def test_http_failed_url_can_be_retried(store: InMemoryStore, settings: Settings):
-    from app.deps import get_services
     from app.main import app
 
     state = {"up": False}
@@ -679,18 +881,12 @@ def test_http_failed_url_can_be_retried(store: InMemoryStore, settings: Settings
     def handler(request: httpx.Request) -> httpx.Response:
         if not state["up"]:
             raise httpx.ConnectError("down", request=request)
-        return httpx.Response(200, text="back", headers={"content-type": "text/plain"})
+        return firecrawl_page("back")
 
-    services = build_services(settings, store, transport=url_transport(handler))
-    app.dependency_overrides[get_services] = lambda: services
-    client = TestClient(app)
-    login = client.post(
-        "/api/auth/login", json={"email": OWNER_EMAIL, "password": OWNER_PASSWORD}
+    services = build_services(
+        firecrawl_settings(settings), store, transport=url_transport(handler)
     )
-    headers = {"Authorization": f"Bearer {login.json()['token']}"}
-    project_id = client.post(
-        "/api/projects", json={"name": "Links"}, headers=headers
-    ).json()["id"]
+    client, headers, project_id = _owner_client(services)
     base = f"/api/projects/{project_id}/sources"
 
     failed = client.post(
@@ -698,7 +894,7 @@ def test_http_failed_url_can_be_retried(store: InMemoryStore, settings: Settings
     )
     assert failed.status_code == 201
     assert failed.json()["status"] == "failed"
-    assert failed.json()["error_message"] == "url could not be fetched"
+    assert failed.json()["error_message"] == "url could not be fetched via firecrawl"
     assert (
         client.post(
             f"{base}/{failed.json()['id']}/reindex", headers=headers
