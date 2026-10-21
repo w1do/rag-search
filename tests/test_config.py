@@ -1,3 +1,5 @@
+import pytest
+
 from vector_core.config import (
     DEFAULT_AI_BASE_URL,
     DEFAULT_AI_EMBEDDING_MODEL,
@@ -59,3 +61,17 @@ def test_firecrawl_settings_are_read_from_env_and_key_is_hidden():
     assert settings.firecrawl_timeout_seconds == 90.0
     assert settings.link_ingestion_configured is True
     assert "fc-secret-value" not in repr(settings)
+
+
+def test_swagger_is_disabled_by_default():
+    assert Settings.from_env({}).swagger_enabled is False
+
+
+def test_swagger_is_enabled_by_env_true():
+    assert Settings.from_env({"SWAGGER": "true"}).swagger_enabled is True
+    assert Settings.from_env({"SWAGGER": "False"}).swagger_enabled is False
+
+
+def test_swagger_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        Settings.from_env({"SWAGGER": "yes"})

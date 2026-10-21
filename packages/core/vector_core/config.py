@@ -21,6 +21,7 @@ DEFAULT_AI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_AI_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 5.0
 DEFAULT_INDEX_TIMEOUT_SECONDS = 30.0
+DEFAULT_SWAGGER_ENABLED = False
 
 
 def normalize_database_url(url: str) -> str:
@@ -57,6 +58,7 @@ class Settings:
     firecrawl_api_key: str = field(default="", repr=False)
     firecrawl_base_url: str = DEFAULT_FIRECRAWL_BASE_URL
     firecrawl_timeout_seconds: float = DEFAULT_FIRECRAWL_TIMEOUT_SECONDS
+    swagger_enabled: bool = DEFAULT_SWAGGER_ENABLED
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -100,6 +102,7 @@ class Settings:
             firecrawl_timeout_seconds=float(
                 source.get("FIRECRAWL_TIMEOUT_SECONDS") or DEFAULT_FIRECRAWL_TIMEOUT_SECONDS
             ),
+            swagger_enabled=_parse_bool(source.get("SWAGGER"), DEFAULT_SWAGGER_ENABLED),
         )
 
     @property
@@ -117,3 +120,12 @@ class Settings:
 
 def _optional_int(value: str | None) -> int | None:
     return int(value) if value else None
+
+
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ValueError("SWAGGER must be true or false")
+    return normalized == "true"

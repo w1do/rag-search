@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.mcp_server import McpEndpoint
 from app.routers import auth, keys, projects, sources, sync, v1
+from vector_core.config import Settings
 from vector_core.domain import DomainError
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-app = FastAPI(title="Vector API", lifespan=lifespan)
+swagger_enabled = Settings.from_env().swagger_enabled
+app = FastAPI(
+    title="Vector API",
+    lifespan=lifespan,
+    docs_url="/docs" if swagger_enabled else None,
+    redoc_url="/redoc" if swagger_enabled else None,
+    openapi_url="/openapi.json" if swagger_enabled else None,
+)
 mcp_endpoint = McpEndpoint(app)
 
 app.include_router(auth.router)
